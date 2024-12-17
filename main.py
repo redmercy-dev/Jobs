@@ -1,50 +1,17 @@
-import asyncio
 import base64
 import json
 import traceback
-import nest_asyncio
 import requests
 from bs4 import BeautifulSoup
-from openai import OpenAI
 import streamlit as st
 import os
 import time
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
-# Apply nest_asyncio to allow nested event loops
-nest_asyncio.apply()
-
-openai_api_key = st.secrets["api_keys"]["openai_api_key"]
-proxy_api_key = st.secrets["api_keys"]["proxy_api_key"]
-
-# Initialize the OpenAI client with the secure API key
-client = OpenAI(api_key=openai_api_key)
-
-# Global thread initialization
-if 'user_thread' not in st.session_state:
-    st.session_state.user_thread = client.beta.threads.create()
-
-# JSON definition for the new scraping tool
-scrape_links_json = {
-    "type": "function",
-    "function": {
-        "name": "fetch_and_process_content",
-        "description": "Fetches content from a specified URL using a proxy setup, extracts links from the fetched page, and retrieves descriptions from these links. The function is designed to retry fetching if it encounters errors and returns a list of job descriptions.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "target_url": {
-                    "type": "string",
-                    "description": "The URL of the webpage from which content is to be fetched. This URL is the starting point for scraping operations."
-                }
-            },
-            "required": ["target_url"]
-        }
-    }
-}
-
+# Note: Removed asyncio and nest_asyncio usage for simplicity and stability.
+# Calling Streamlit commands from multiple threads or async contexts can cause "missing ScriptRunContext" errors.
+# This version runs the calls synchronously and ensures Streamlit functions are only used in the main thread.
 
 def extract_text_and_links_from_url(target_url):
     """Fetches the job posting links and their corresponding descriptions from the given URL."""
@@ -80,13 +47,11 @@ def extract_text_and_links_from_url(target_url):
         """Fetches and extracts the job description text from the given job link."""
         soup = fetch_content_via_proxy(full_url)
         if soup:
-            # Remove script and style elements
             [script_or_style.decompose() for script_or_style in soup(['script', 'style'])]
-            # Extract text
             return ' '.join(soup.stripped_strings)
         return "Failed to fetch the job description."
 
-    job_patterns = ['/vacancies/', '/job/']  # Fixed patterns to identify job postings
+    job_patterns = ['/vacancies/', '/job/']  # Patterns to identify job postings
 
     soup = fetch_content_via_proxy(target_url)
     if not soup:
@@ -106,7 +71,7 @@ def extract_text_and_links_from_url(target_url):
         job_description = scrape_job_description(job_link['href'])
         return job_link['href'], job_description
 
-    # Use ThreadPoolExecutor to fetch descriptions in parallel
+    # Use ThreadPoolExecutor to fetch descriptions in parallel for the first 2 results
     max_workers = min(3, len(results)+1)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(fetch_and_store_description, job_link): job_link for job_link in results[:2]}
@@ -124,7 +89,25 @@ def fetch_and_process_content(target_url):
     return extract_text_and_links_from_url(target_url)
 
 
-# Define function specifications for content scraping
+# JSON definition for the new scraping tool
+scrape_links_json = {
+    "type": "function",
+    "function": {
+        "name": "fetch_and_process_content",
+        "description": "Fetches content from a specified URL using a proxy, extracts links and descriptions.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target_url": {
+                    "type": "string",
+                    "description": "The URL of the webpage from which content is to be fetched."
+                }
+            },
+            "required": ["target_url"]
+        }
+    }
+}
+
 tools = [
     scrape_links_json,
     {"type": "code_interpreter"},
@@ -135,8 +118,6 @@ available_functions = {
     "fetch_and_process_content": fetch_and_process_content,
 }
 
-
-# Instructions for the assistant
 instructions = """
 You are a Job Description Analyzer that helps users discover suitable job opportunities directly from live web scraping. Instead of relying on uploaded job descriptions, you will use custom functions to scrape job postings from three specific websites:
 - https://treuhand-job.ch
@@ -188,6 +169,7 @@ Be Interactive:
 1. Continuously refine recommendations based on feedback from the user.
 2. Keep the conversation engaging by asking follow-up questions to clarify their interests and criteria.
 3. Limit each scraping action to return only a few (up to 3) results at a time to maintain relevancy and prompt user feedback.
+
 Additional Notes:
 1. Always rely on the live scraping custom function for the latest job postings—no file upload is involved.
 2. The user’s queries guide you in adjusting scraping parameters (e.g., filtering by industry, role, location).
@@ -196,8 +178,7 @@ Additional Notes:
 5. The ultimate goal is to make the process of discovering job opportunities dynamic, relevant, and user-focused.
 """
 
-
-def create_assistant(file_ids):
+def create_assistant(client, file_ids):
     assistant = client.beta.assistants.create(
         name="Jobs assistant",
         instructions=instructions,
@@ -224,9 +205,11 @@ def safe_tool_call(func, tool_name, **kwargs):
         return f"Error occurred in {tool_name}: {str(e)}"
 
 
-def handle_tool_outputs(run):
+def handle_tool_outputs(client, run, thread_id):
     tool_outputs = []
     try:
+        if not run.required_action or not run.required_action.submit_tool_outputs:
+            return run
         for call in run.required_action.submit_tool_outputs.tool_calls:
             function_name = call.function.name
             function = available_functions.get(function_name)
@@ -242,72 +225,94 @@ def handle_tool_outputs(run):
             })
 
         return client.beta.threads.runs.submit_tool_outputs(
-            thread_id=st.session_state.user_thread.id,
+            thread_id=thread_id,
             run_id=run.id,
             tool_outputs=tool_outputs
         )
     except Exception as e:
         st.error(f"Error in handle_tool_outputs: {str(e)}")
         st.error(traceback.format_exc())
-        return None
+        return run
 
 
-async def get_agent_response(assistant_id, user_message):
-    try:
-        with st.spinner("Processing your request..."):
-            client.beta.threads.messages.create(
-                thread_id=st.session_state.user_thread.id,
-                role="user",
-                content=user_message,
-            )
+def get_agent_response(client, assistant_id, user_message, thread_id):
+    with st.spinner("Processing your request..."):
+        # Post user message
+        client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=user_message,
+        )
 
-            run = client.beta.threads.runs.create(
-                thread_id=st.session_state.user_thread.id,
-                assistant_id=assistant_id,
-            )
+        # Create a run
+        run = client.beta.threads.runs.create(
+            thread_id=thread_id,
+            assistant_id=assistant_id,
+        )
 
-            while run.status in ["queued", "in_progress"]:
-                run = client.beta.threads.runs.retrieve(
-                    thread_id=st.session_state.user_thread.id,
-                    run_id=run.id
-                )
-                if run.status == "requires_action":
-                    run = handle_tool_outputs(run)
-                await asyncio.sleep(1)
-
-            last_message = client.beta.threads.messages.list(thread_id=st.session_state.user_thread.id, limit=1).data[0]
-
-            formatted_response_text = ""
-            download_links = []
-            images = []
-
-            if last_message.role == "assistant":
-                for content in last_message.content:
-                    if content.type == "text":
-                        formatted_response_text += content.text.value
-                        for annotation in content.text.annotations:
-                            if annotation.type == "file_path":
-                                file_id = annotation.file_path.file_id
-                                file_name = annotation.text.split('/')[-1]
-                                file_content = client.files.content(file_id).read()
-                                download_links.append((file_name, file_content))
-                    elif content.type == "image_file":
-                        file_id = content.image_file.file_id
-                        image_data = client.files.content(file_id).read()
-                        images.append((f"{file_id}.png", image_data))
-                        formatted_response_text += f"[Image generated: {file_id}.png]\n"
+        # Poll run status
+        while run.status in ["queued", "in_progress", "requires_action"]:
+            if run.status == "requires_action":
+                # Handle tool outputs if required
+                run = handle_tool_outputs(client, run, thread_id)
             else:
-                formatted_response_text = "Error: No assistant response"
+                time.sleep(1)
 
-            return formatted_response_text, download_links, images
-    except Exception as e:
-        st.error(f"Error in get_agent_response: {str(e)}")
-        st.error(traceback.format_exc())
-        return f"Error: {str(e)}", [], []
+            if run.status not in ["queued", "in_progress", "requires_action"]:
+                break
+
+            # Update run status
+            run = client.beta.threads.runs.retrieve(
+                thread_id=thread_id,
+                run_id=run.id
+            )
+
+        # Fetch the last assistant message
+        messages = client.beta.threads.messages.list(thread_id=thread_id, limit=1).data
+        if not messages:
+            return "Error: No assistant response", [], []
+
+        last_message = messages[0]
+
+        formatted_response_text = ""
+        download_links = []
+        images = []
+
+        if last_message.role == "assistant":
+            for content in last_message.content:
+                if content.type == "text":
+                    formatted_response_text += content.text.value
+                    for annotation in content.text.annotations:
+                        if annotation.type == "file_path":
+                            file_id = annotation.file_path.file_id
+                            file_name = annotation.text.split('/')[-1]
+                            file_content = client.files.content(file_id).read()
+                            download_links.append((file_name, file_content))
+                elif content.type == "image_file":
+                    file_id = content.image_file.file_id
+                    image_data = client.files.content(file_id).read()
+                    images.append((f"{file_id}.png", image_data))
+                    formatted_response_text += f"[Image generated: {file_id}.png]\n"
+        else:
+            formatted_response_text = "Error: No assistant response"
+
+        return formatted_response_text, download_links, images
 
 
 def main():
     st.title("Jobs assistant")
+
+    # Retrieve API keys from secrets inside main thread
+    openai_api_key = st.secrets["api_keys"]["openai_api_key"]
+    proxy_api_key = st.secrets["api_keys"]["proxy_api_key"]
+
+    # Import and initialize the OpenAI client with the secure API key
+    from openai import OpenAI
+    client = OpenAI(api_key=openai_api_key)
+
+    # Global thread initialization
+    if 'user_thread' not in st.session_state:
+        st.session_state.user_thread = client.beta.threads.create()
 
     # Sidebar for assistant selection
     st.sidebar.title("Assistant Configuration")
@@ -323,7 +328,7 @@ def main():
 
         if file_ids:
             if st.sidebar.button("Create New Assistant"):
-                st.session_state.assistant_id = create_assistant(file_ids)
+                st.session_state.assistant_id = create_assistant(client, file_ids)
                 st.sidebar.success(f"New assistant created with ID: {st.session_state.assistant_id}")
         else:
             st.sidebar.warning("Please upload files to create an assistant.")
@@ -361,7 +366,8 @@ def main():
                         mime="image/png"
                     )
 
-    if prompt := st.chat_input("You:"):
+    prompt = st.chat_input("You:")
+    if prompt:
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -369,7 +375,7 @@ def main():
         if 'assistant_id' in st.session_state:
             with st.chat_message("assistant"):
                 message_placeholder = st.empty()
-                response, download_links, images = asyncio.run(get_agent_response(st.session_state.assistant_id, prompt))
+                response, download_links, images = get_agent_response(client, st.session_state.assistant_id, prompt, st.session_state.user_thread.id)
                 message_placeholder.markdown(response)
 
                 for file_name, file_content in download_links:
