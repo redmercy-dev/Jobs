@@ -9,7 +9,6 @@ import time
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
 def extract_text_and_links_from_url(target_url):
     """Fetches the job posting links and their corresponding descriptions from the given URL."""
     PROXY_URL = 'https://proxy.scrapeops.io/v1/'
@@ -18,20 +17,20 @@ def extract_text_and_links_from_url(target_url):
     retry_delay = 1  # Initial retry delay in seconds
 
     def fetch_content_via_proxy(url):
-        params = {
-            'api_key': API_KEY,
-            'url': url,
-            'render_js': 'false',
-            'residential': 'true',
-        }
         for attempt in range(max_attempts):
+            params = {
+                'api_key': API_KEY,
+                'url': url,
+                'render_js': 'false',
+                'residential': 'true',
+            }
             response = requests.get(PROXY_URL, params=params)
             if response.status_code == 200:
                 return BeautifulSoup(response.text, 'html.parser')
             elif response.status_code == 500 and attempt == 0:
                 print("Received status code 500, retrying...")
             elif response.status_code == 429:
-                wait = retry_delay * (2 ** attempt)  # Exponential backoff for rate limiting
+                wait = retry_delay * (2 ** attempt)
                 print(f"Rate limit exceeded, retrying in {wait} seconds...")
                 time.sleep(wait)
             else:
@@ -65,16 +64,18 @@ def extract_text_and_links_from_url(target_url):
     ]
 
     def fetch_and_store_description(job_link):
-        job_description = scrape_job_description(job_link['href'])
-        return job_link['href'], job_description
+        return job_link['href'], scrape_job_description(job_link['href'])
 
     # Use ThreadPoolExecutor to fetch descriptions in parallel for the first 2 results
     max_workers = min(3, len(results)+1)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(fetch_and_store_description, job_link): job_link for job_link in results[:2]}
-        job_descriptions = {future.result()[0]: future.result()[1] for future in as_completed(futures)}
+    job_descriptions = {}
+    if results:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(fetch_and_store_description, job_link): job_link for job_link in results[:2]}
+            for future in as_completed(futures):
+                href, desc = future.result()
+                job_descriptions[href] = desc
 
-    # Update results with job descriptions
     for job_link in results:
         job_link['job_description'] = job_descriptions.get(job_link['href'], 'No description available')
 
@@ -176,18 +177,23 @@ Additional Notes:
 """
 
 def create_assistant(client, file_ids):
-    assistant = client.beta.assistants.create(
-        name="Jobs assistant",
-        instructions=instructions,
-        model="gpt-4o-mini",
-        tools=tools,
-        tool_resources={
+    # If no files are provided, do not include vector_stores in tool_resources
+    tool_resources = {}
+    if file_ids:
+        tool_resources = {
             'file_search': {
                 'vector_stores': [{
                     'file_ids': file_ids
                 }]
             }
         }
+
+    assistant = client.beta.assistants.create(
+        name="Jobs assistant",
+        instructions=instructions,
+        model="gpt-4o-mini",
+        tools=tools,
+        tool_resources=tool_resources
     )
     return assistant.id
 
@@ -205,6 +211,7 @@ def safe_tool_call(func, tool_name, **kwargs):
 def handle_tool_outputs(client, run, thread_id):
     tool_outputs = []
     try:
+        # Check if run.required_action exists and has submit_tool_outputs
         if not run.required_action or not run.required_action.submit_tool_outputs:
             return run
         for call in run.required_action.submit_tool_outputs.tool_calls:
@@ -213,8 +220,8 @@ def handle_tool_outputs(client, run, thread_id):
             if not function:
                 raise ValueError(f"Function {function_name} not found in available_functions.")
             arguments = json.loads(call.function.arguments)
-            with st.spinner(f"Executing a detailed search..."):
-                output = safe_tool_call(function, function_name, **arguments)
+            # Execute the tool call without Streamlit calls in other threads
+            output = safe_tool_call(function, function_name, **arguments)
 
             tool_outputs.append({
                 "tool_call_id": call.id,
@@ -233,67 +240,65 @@ def handle_tool_outputs(client, run, thread_id):
 
 
 def get_agent_response(client, assistant_id, user_message, thread_id):
-    with st.spinner("Processing your request..."):
-        # Post user message
-        client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=user_message,
-        )
+    # Post user message
+    client.beta.threads.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=user_message,
+    )
 
-        # Create a run
-        run = client.beta.threads.runs.create(
-            thread_id=thread_id,
-            assistant_id=assistant_id,
-        )
+    # Create a run
+    run = client.beta.threads.runs.create(
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+    )
 
-        # Poll run status
-        while run.status in ["queued", "in_progress", "requires_action"]:
-            if run.status == "requires_action":
-                # Handle tool outputs if required
-                run = handle_tool_outputs(client, run, thread_id)
-            else:
-                time.sleep(1)
-
-            if run.status not in ["queued", "in_progress", "requires_action"]:
-                break
-
-            # Update run status
-            run = client.beta.threads.runs.retrieve(
-                thread_id=thread_id,
-                run_id=run.id
-            )
-
-        # Fetch the last assistant message
-        messages = client.beta.threads.messages.list(thread_id=thread_id, limit=1).data
-        if not messages:
-            return "Error: No assistant response", [], []
-
-        last_message = messages[0]
-
-        formatted_response_text = ""
-        download_links = []
-        images = []
-
-        if last_message.role == "assistant":
-            for content in last_message.content:
-                if content.type == "text":
-                    formatted_response_text += content.text.value
-                    for annotation in content.text.annotations:
-                        if annotation.type == "file_path":
-                            file_id = annotation.file_path.file_id
-                            file_name = annotation.text.split('/')[-1]
-                            file_content = client.files.content(file_id).read()
-                            download_links.append((file_name, file_content))
-                elif content.type == "image_file":
-                    file_id = content.image_file.file_id
-                    image_data = client.files.content(file_id).read()
-                    images.append((f"{file_id}.png", image_data))
-                    formatted_response_text += f"[Image generated: {file_id}.png]\n"
+    # Poll run status
+    while run.status in ["queued", "in_progress", "requires_action"]:
+        if run.status == "requires_action":
+            run = handle_tool_outputs(client, run, thread_id)
         else:
-            formatted_response_text = "Error: No assistant response"
+            time.sleep(1)
 
-        return formatted_response_text, download_links, images
+        if run.status not in ["queued", "in_progress", "requires_action"]:
+            break
+
+        # Update run status
+        run = client.beta.threads.runs.retrieve(
+            thread_id=thread_id,
+            run_id=run.id
+        )
+
+    # Fetch the last assistant message
+    messages = client.beta.threads.messages.list(thread_id=thread_id, limit=1).data
+    if not messages:
+        return "Error: No assistant response", [], []
+
+    last_message = messages[0]
+
+    formatted_response_text = ""
+    download_links = []
+    images = []
+
+    if last_message.role == "assistant":
+        for content in last_message.content:
+            if content.type == "text":
+                formatted_response_text += content.text.value
+                for annotation in content.text.annotations:
+                    if annotation.type == "file_path":
+                        file_id = annotation.file_path.file_id
+                        file_name = annotation.text.split('/')[-1]
+                        file_content = client.files.content(file_id).read()
+                        download_links.append((file_name, file_content))
+            elif content.type == "image_file":
+                file_id = content.image_file.file_id
+                image_data = client.files.content(file_id).read()
+                images.append((f"{file_id}.png", image_data))
+                formatted_response_text += f"[Image generated: {file_id}.png]\n"
+    else:
+        formatted_response_text = "Error: No assistant response"
+
+    return formatted_response_text, download_links, images
 
 
 def main():
@@ -301,9 +306,9 @@ def main():
 
     # Retrieve API keys from secrets inside main thread
     openai_api_key = st.secrets["api_keys"]["openai_api_key"]
+    # The proxy_api_key is currently unused but kept for reference
     proxy_api_key = st.secrets["api_keys"]["proxy_api_key"]
 
-    # Import and initialize the OpenAI client with the secure API key
     from openai import OpenAI
     client = OpenAI(api_key=openai_api_key)
 
@@ -316,19 +321,16 @@ def main():
     assistant_choice = st.sidebar.radio("Choose an option:", ["Create New Assistant", "Use Existing Assistant"])
 
     if assistant_choice == "Create New Assistant":
-        uploaded_files = st.sidebar.file_uploader("Upload files", accept_multiple_files=True)
+        uploaded_files = st.sidebar.file_uploader("Upload files (optional)", accept_multiple_files=True)
         file_ids = []
         if uploaded_files:
             for uploaded_file in uploaded_files:
                 file_info = client.files.create(file=uploaded_file, purpose='assistants')
                 file_ids.append(file_info.id)
 
-        if file_ids:
-            if st.sidebar.button("Create New Assistant"):
-                st.session_state.assistant_id = create_assistant(client, file_ids)
-                st.sidebar.success(f"New assistant created with ID: {st.session_state.assistant_id}")
-        else:
-            st.sidebar.warning("Please upload files to create an assistant.")
+        if st.sidebar.button("Create New Assistant"):
+            st.session_state.assistant_id = create_assistant(client, file_ids)
+            st.sidebar.success(f"New assistant created with ID: {st.session_state.assistant_id}")
 
     else:  # Use Existing Assistant
         assistant_id = st.sidebar.text_input("Enter existing assistant ID:")
@@ -375,6 +377,7 @@ def main():
                 response, download_links, images = get_agent_response(client, st.session_state.assistant_id, prompt, st.session_state.user_thread.id)
                 message_placeholder.markdown(response)
 
+                # Handle downloads and images in main thread
                 for file_name, file_content in download_links:
                     st.download_button(
                         label=f"Download {file_name}",
