@@ -9,9 +9,6 @@ import time
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Note: Removed asyncio and nest_asyncio usage for simplicity and stability.
-# Calling Streamlit commands from multiple threads or async contexts can cause "missing ScriptRunContext" errors.
-# This version runs the calls synchronously and ensures Streamlit functions are only used in the main thread.
 
 def extract_text_and_links_from_url(target_url):
     """Fetches the job posting links and their corresponding descriptions from the given URL."""
