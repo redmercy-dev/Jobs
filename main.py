@@ -188,7 +188,7 @@ Be Interactive:
 1. Continuously refine recommendations based on feedback from the user.
 2. Keep the conversation engaging by asking follow-up questions to clarify their interests and criteria.
 3. Limit each scraping action to return only a few (up to 3) results at a time to maintain relevancy and prompt user feedback.
-
+The search needs to be based on what the user asked only. You can use the scrapping function again and again to get accurate results.
 Additional Notes:
 1. Always rely on the live scraping custom function for the latest job postings—no file upload is involved.
 2. The user’s queries guide you in adjusting scraping parameters (e.g., filtering by industry, role, location).
@@ -202,7 +202,7 @@ def create_assistant(file_ids):
     assistant = client.beta.assistants.create(
         name="LegalAI assistant",
         instructions=instructions,
-        model="gpt-4o-mini",
+        model="gpt-4o",
         tools=tools,
         tool_resources={
             'file_search': {
@@ -308,7 +308,7 @@ async def get_agent_response(assistant_id, user_message):
 
 
 def main():
-    st.title("Legal assistant")
+    st.title("Jobs assistant")
 
     # Sidebar for assistant selection
     st.sidebar.title("Assistant Configuration")
