@@ -107,7 +107,7 @@ def extract_text_and_links_from_url(target_url):
         return job_link['href'], job_description
 
     # Use ThreadPoolExecutor to fetch descriptions in parallel
-    max_workers = min(5, len(results)+1)
+    max_workers = min(3, len(results)+1)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(fetch_and_store_description, job_link): job_link for job_link in results[:2]}
         job_descriptions = {future.result()[0]: future.result()[1] for future in as_completed(futures)}
@@ -188,7 +188,6 @@ Be Interactive:
 1. Continuously refine recommendations based on feedback from the user.
 2. Keep the conversation engaging by asking follow-up questions to clarify their interests and criteria.
 3. Limit each scraping action to return only a few (up to 3) results at a time to maintain relevancy and prompt user feedback.
-The search needs to be based on what the user asked only. You can use the scrapping function again and again to get accurate results.
 Additional Notes:
 1. Always rely on the live scraping custom function for the latest job postings—no file upload is involved.
 2. The user’s queries guide you in adjusting scraping parameters (e.g., filtering by industry, role, location).
@@ -200,9 +199,9 @@ Additional Notes:
 
 def create_assistant(file_ids):
     assistant = client.beta.assistants.create(
-        name="LegalAI assistant",
+        name="Jobs assistant",
         instructions=instructions,
-        model="gpt-4o",
+        model="gpt-4o-mini",
         tools=tools,
         tool_resources={
             'file_search': {
